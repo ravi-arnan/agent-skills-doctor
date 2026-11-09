@@ -1,0 +1,46 @@
+{
+  "name": "agent-skills-doctor",
+  "version": "1.0.0",
+  "description": "Zero-dependency health check, linter, and token auditor for AI agent skills across Claude Code, OpenCode, Cursor, and 13 other harnesses",
+  "type": "module",
+  "main": "cli.mjs",
+  "bin": {
+    "skills-doctor": "./cli.mjs",
+    "agent-skills-doctor": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test cli.test.mjs"
+  },
+  "keywords": [
+    "ai-agents",
+    "agent-skills",
+    "claude-code",
+    "opencode",
+    "cursor",
+    "windsurf",
+    "cline",
+    "antigravity",
+    "linter",
+    "context-window",
+    "token-budget",
+    "skills"
+  ],
+  "author": "Ravi Arnan <ravi-arnan@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ravi-arnan/agent-skills-doctor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ravi-arnan/agent-skills-doctor/issues"
+  },
+  "homepage": "https://github.com/ravi-arnan/agent-skills-doctor#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
