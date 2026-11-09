@@ -5,8 +5,8 @@
   "type": "module",
   "main": "cli.mjs",
   "bin": {
-    "skills-doctor": "./cli.mjs",
-    "agent-skills-doctor": "./cli.mjs"
+    "skills-doctor": "cli.mjs",
+    "agent-skills-doctor": "cli.mjs"
   },
   "files": [
     "cli.mjs",
@@ -34,7 +34,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ravi-arnan/agent-skills-doctor.git"
+    "url": "git+https://github.com/ravi-arnan/agent-skills-doctor.git"
   },
   "bugs": {
     "url": "https://github.com/ravi-arnan/agent-skills-doctor/issues"
