@@ -67,3 +67,51 @@ test('audit reports a clean tree as clean', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('budget flag detects when tokens exceed limit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-budget-'));
+  try {
+    skill(join(root, '.commandcode/skills/heavy'), 'heavy', 'a'.repeat(200));
+    const passResult = audit({ project: root, includeGlobal: false, budget: 1000 });
+    assert.equal(passResult.budget.exceeded, false);
+
+    const failResult = audit({ project: root, includeGlobal: false, budget: 10 });
+    assert.equal(failResult.budget.exceeded, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('topSkills calculates and sorts metadata tokens correctly', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-top-'));
+  try {
+    skill(join(root, '.commandcode/skills/small'), 'small', 'short');
+    skill(join(root, '.commandcode/skills/large'), 'large', 'a'.repeat(400));
+    const result = audit({ project: root, includeGlobal: false });
+    assert.ok(result.cmd.topSkills.length >= 2);
+    assert.equal(result.cmd.topSkills[0].name, 'large');
+    assert.ok(result.cmd.topSkills[0].tokens > result.cmd.topSkills[1].tokens);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fix flag renames mismatched directory and cleans broken symlinks', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-fix-'));
+  try {
+    skill(join(root, '.commandcode/skills/wrong-name'), 'correct-name', 'a skill with mismatched directory');
+    symlinkSync(join(root, 'non-existent'), join(root, '.commandcode/skills/dangling'));
+
+    const before = audit({ project: root, includeGlobal: false });
+    assert.equal(before.invalid.length, 1);
+    assert.equal(before.broken.length, 1);
+
+    const after = audit({ project: root, includeGlobal: false, fix: true });
+    assert.equal(after.fixes.length, 2);
+    assert.equal(after.invalid.length, 0);
+    assert.equal(after.broken.length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+

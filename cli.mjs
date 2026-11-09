@@ -23,9 +23,11 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
+  rmSync,
   statSync,
 } from 'node:fs';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
@@ -314,11 +316,21 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
   }
   const entries = [...winners.values()];
   const tokens = entries.reduce((sum, { skill }) => sum + Math.ceil(skill.chars / 4), 0);
+  const topSkills = [...entries]
+    .sort((a, b) => b.skill.chars - a.skill.chars)
+    .map(({ skill, root }) => ({
+      name: skill.name,
+      root,
+      chars: skill.chars,
+      tokens: Math.ceil(skill.chars / 4),
+    }));
+
   return {
     roots,
     count: entries.length,
     tokens,
     shadowed,
+    topSkills,
     skills: entries.map(({ skill, root }) => ({
       name: skill.name,
       root,
@@ -326,6 +338,36 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
       invalid: skill.problems,
     })),
   };
+}
+
+export function applyFixes({ invalid = [], broken = [] } = {}) {
+  const fixes = [];
+  // 1. Rename mismatched skill directories if safe and target doesn't exist
+  for (const s of invalid) {
+    if (!s.name || s.problems.length > 1) continue;
+    const isMismatch = s.problems[0]?.includes('does not match directory');
+    if (!isMismatch) continue;
+    const parent = dirname(s.dir);
+    const targetDir = join(parent, s.name);
+    if (!existsSync(targetDir)) {
+      try {
+        renameSync(s.dir, targetDir);
+        fixes.push({ type: 'rename', from: s.dir, to: targetDir, name: s.name });
+      } catch {}
+    }
+  }
+
+  // 2. Remove broken dangling symlinks
+  for (const b of broken) {
+    try {
+      if (lstatSync(b.path).isSymbolicLink()) {
+        rmSync(b.path);
+        fixes.push({ type: 'remove_broken', path: b.path });
+      }
+    } catch {}
+  }
+
+  return fixes;
 }
 
 export function audit(options = {}) {
@@ -346,7 +388,25 @@ export function audit(options = {}) {
     root.skills.filter((s) => s.problems.length).map((s) => ({ root: root.rel, dir: s.dir, name: s.name, problems: s.problems })),
   );
   const broken = present.flatMap((root) => root.broken);
-  return { project, scanned, duplicates, cmd, invalid, broken };
+
+  if (options.fix) {
+    const fixes = applyFixes({ invalid, broken });
+    if (fixes.length) {
+      const rescanned = audit({ ...options, fix: false });
+      return { ...rescanned, fixes };
+    }
+  }
+
+  let budget = null;
+  if (typeof options.budget === 'number' && !isNaN(options.budget)) {
+    budget = {
+      limit: options.budget,
+      tokens: cmd.tokens,
+      exceeded: cmd.tokens > options.budget,
+    };
+  }
+
+  return { project, scanned, duplicates, cmd, invalid, broken, budget, fixes: [], options };
 }
 
 // ------------------------------------------------------------------- report
@@ -388,9 +448,37 @@ function report(result) {
     lines.push(`  ${root.exists ? `${root.skills.length} skills` : 'absent'}  ${root.rel}`);
   }
   lines.push(`  loads ${result.cmd.count} skills, ~${result.cmd.tokens} tokens of metadata (${pct(result.cmd.tokens, 200000)} of a 200k window)`);
+  if (result.budget) {
+    if (result.budget.exceeded) {
+      lines.push(`  budget exceeded: ~${result.budget.tokens} tokens (limit: ${result.budget.limit})`);
+    } else {
+      lines.push(`  budget check: ~${result.budget.tokens} / ${result.budget.limit} tokens (within limit)`);
+    }
+  }
+
   if (result.cmd.shadowed.length) {
     lines.push(`  shadowed: ${result.cmd.shadowed.length}`);
     for (const s of result.cmd.shadowed) lines.push(`    ${s.name}: keeps ${s.kept}, drops ${s.dropped}`);
+  }
+
+  if (result.options?.top && result.cmd.topSkills?.length) {
+    const n = Math.min(result.options.top, result.cmd.topSkills.length);
+    lines.push('');
+    lines.push(`top ${n} skills by metadata token cost:`);
+    const namePad = Math.max(...result.cmd.topSkills.slice(0, n).map((s) => s.name.length), 10);
+    for (let i = 0; i < n; i++) {
+      const s = result.cmd.topSkills[i];
+      lines.push(`  ${String(i + 1).padStart(2)}. ${s.name.padEnd(namePad)}  ~${String(s.tokens).padStart(4)} tokens (${s.chars} chars)`);
+    }
+  }
+
+  if (result.fixes?.length) {
+    lines.push('');
+    lines.push(`fixes applied: ${result.fixes.length}`);
+    for (const f of result.fixes) {
+      if (f.type === 'rename') lines.push(`  renamed directory ${f.from} -> ${f.name}`);
+      if (f.type === 'remove_broken') lines.push(`  removed broken symlink ${f.path}`);
+    }
   }
 
   const issues = [];
@@ -415,6 +503,10 @@ function report(result) {
       }
     }
   }
+  if (result.budget?.exceeded) {
+    count++;
+    issues.push(`budget: metadata token cost (~${result.budget.tokens}) exceeds limit (${result.budget.limit})`);
+  }
 
   lines.push('');
   if (!count) {
@@ -435,14 +527,21 @@ function report(result) {
 
 function help() {
   return [
-    'usage: skills-doctor [--json] [--project <dir>] [--no-global] [--no-project] [--root <dir>]...',
+    'usage: skills-doctor [options]',
     '',
-    'Read-only audit of agent skills across every harness root on the machine.',
+    'Health check, linter, and token auditor for agent skills across every harness root.',
+    '',
+    'Options:',
+    '  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)',
+    '  --budget <n>   fail with exit code 1 if metadata exceeds token limit',
+    '  --top <n>      display top N skills by metadata token cost',
     '  --json         machine-readable output',
-    '  --project      directory to resolve project roots against (default: cwd)',
-    '  --no-global    skip the user-level roots',
-    '  --no-project   skip the project-level roots',
+    '  --project <dir> directory to resolve project roots against (default: cwd)',
+    '  --no-global    skip user-level global roots',
+    '  --no-project   skip project-level roots',
     '  --root <dir>   extra root to scan (repeatable)',
+    '  -h, --help     show this help text',
+    '',
     'exit: 0 clean, 1 problems found, 2 usage error',
   ].join('\n');
 }
@@ -452,9 +551,12 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--json') options.json = true;
+    else if (arg === '--fix') options.fix = true;
     else if (arg === '--no-global') options.includeGlobal = false;
     else if (arg === '--no-project') options.includeProject = false;
     else if (arg === '--project') options.project = argv[++i];
+    else if (arg === '--budget') options.budget = Number(argv[++i]);
+    else if (arg === '--top') options.top = Number(argv[++i]);
     else if (arg === '--root') options.extraRoots.push(argv[++i]);
     else if (arg === '--help' || arg === '-h') options.help = true;
     else return { error: `unknown argument: ${arg}` };
@@ -475,10 +577,11 @@ function main(argv) {
   }
 
   const result = audit(options);
-  const count =
+  let count =
     result.invalid.length +
     result.broken.length +
     result.duplicates.filter((d) => d.status === 'drift').length;
+  if (result.budget?.exceeded) count++;
 
   if (options.json) {
     console.log(JSON.stringify({ ...result, problemCount: count }, null, 2));

@@ -78,43 +78,55 @@ skills-doctor
 ## CLI Options
 
 ```text
-usage: skills-doctor [--json] [--project <dir>] [--no-global] [--no-project] [--root <dir>]...
+usage: skills-doctor [options]
+
+Health check, linter, and token auditor for agent skills across every harness root.
 
 Options:
-  --json         Print machine-readable JSON output
-  --project      Directory to resolve project roots against (default: current working directory)
-  --no-global    Skip user-level global roots
-  --no-project   Skip project-level roots
-  --root <dir>   Add an extra custom root directory to scan (repeatable)
-  -h, --help     Show this help message
+  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)
+  --budget <n>   fail with exit code 1 if metadata exceeds token limit
+  --top <n>      display top N skills by metadata token cost
+  --json         machine-readable output
+  --project <dir> directory to resolve project roots against (default: cwd)
+  --no-global    skip user-level global roots
+  --no-project   skip project-level roots
+  --root <dir>   extra root to scan (repeatable)
+  -h, --help     show this help text
 ```
 
 ### Exit Codes
 - `0`: Clean tree, no problems found.
-- `1`: Problems detected (invalid skills, broken symlinks, or content drift).
+- `1`: Problems detected (invalid skills, broken symlinks, content drift, or exceeded token budget).
 - `2`: Usage or configuration error.
 
 ---
 
-## CI / Pre-commit Integration
+## CI / GitHub Action Integration
 
-Add `agent-skills-doctor` to your CI pipeline or pre-commit hooks to ensure skills repository hygiene:
+You can use `agent-skills-doctor` directly as a GitHub Action in your workflows:
 
 ```yaml
-# .github/workflows/skills-lint.yml
+# .github/workflows/skills-doctor.yml
 name: Lint Skills
 on: [push, pull_request]
 
 jobs:
-  audit:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: ravi-arnan/agent-skills-doctor@main
         with:
-          node-version: 20
-      - run: npx agent-skills-doctor --no-global
+          budget: 4000
+          no-global: 'true'
 ```
+
+Or run via `npx`:
+
+```bash
+npx agent-skills-doctor --no-global --budget 4000
+```
+
 
 ---
 

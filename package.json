@@ -1,6 +1,6 @@
 {
   "name": "agent-skills-doctor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zero-dependency health check, linter, and token auditor for AI agent skills across Claude Code, OpenCode, Cursor, and 13 other harnesses",
   "type": "module",
   "main": "cli.mjs",

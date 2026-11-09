@@ -1,0 +1,41 @@
+name: 'agent-skills-doctor'
+description: 'Zero-dependency health check, linter, and token auditor for AI agent skills across Claude Code, Cursor, OpenCode, and more'
+author: 'Ravi Arnan'
+branding:
+  icon: 'activity'
+  color: 'blue'
+
+inputs:
+  project:
+    description: 'Directory to resolve project roots against (default: current directory)'
+    required: false
+    default: '.'
+  budget:
+    description: 'Maximum token limit for metadata catalog. Fails with exit code 1 if exceeded'
+    required: false
+  no-global:
+    description: 'Skip scanning user-level global roots (ideal for CI repos)'
+    required: false
+    default: 'true'
+  fix:
+    description: 'Automatically fix safe issues like directory name mismatches and dangling symlinks'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run agent-skills-doctor
+      shell: bash
+      run: |
+        CMD="node ${{ github.action_path }}/cli.mjs --project ${{ inputs.project }}"
+        if [ "${{ inputs.no-global }}" = "true" ]; then
+          CMD="$CMD --no-global"
+        fi
+        if [ -n "${{ inputs.budget }}" ]; then
+          CMD="$CMD --budget ${{ inputs.budget }}"
+        fi
+        if [ "${{ inputs.fix }}" = "true" ]; then
+          CMD="$CMD --fix"
+        fi
+        $CMD
