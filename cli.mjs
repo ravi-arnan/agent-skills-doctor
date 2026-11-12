@@ -105,6 +105,52 @@ export function parseFrontmatter(text) {
   return { name: field('name'), description: field('description') };
 }
 
+// Scans SKILL.md body for relative links or companion script paths that do not exist on disk.
+export function findMissingReferences(text, dir) {
+  const clean = text.replace(/```[\s\S]*?```/g, '');
+  const missing = [];
+  const seen = new Set();
+  const isPlaceholder = (p) => /<.*?>|\[.*?\]|\.\.\/|\*|\?|path\/to|example\//i.test(p);
+
+  // 1. Markdown links & image embeds: [text](path) or ![alt](path)
+  const linkRegex = /(?:\[[^\]]*\]|!\[[^\]]*\])\((?!https?:\/\/|mailto:|#|file:)([^)#\s]+)(?:#[^)]*)?\)/g;
+  let m;
+  while ((m = linkRegex.exec(clean)) !== null) {
+    const rel = m[1].trim().replace(/^["']|["']$/g, '');
+    if (!rel || isPlaceholder(rel)) continue;
+    if (
+      rel.startsWith('./') ||
+      /^(?:scripts|references|reference|templates|resources|assets|examples)\//i.test(rel) ||
+      /\.(?:md|sh|py|js|mjs|json|ya?ml|png|jpg|svg)$/i.test(rel)
+    ) {
+      const target = resolve(dir, rel);
+      if (!existsSync(target) && !seen.has(rel)) {
+        seen.add(rel);
+        missing.push({ ref: rel, type: 'link' });
+      }
+    }
+  }
+
+  // 2. Scripts and explicit relative companion paths in backticks: `scripts/run.sh` or `./scripts/run.py`
+  const codeRegex = /`(?:\.\/)?((?:scripts|references|reference|templates|resources|assets)\/[a-zA-Z0-9_.-]+)(?:\s+[^`]*)?`/g;
+  while ((m = codeRegex.exec(clean)) !== null) {
+    const fullMatch = m[0];
+    const rel = m[1].trim().replace(/[.,;:]+$/, '');
+    if (!rel || isPlaceholder(rel)) continue;
+    const isExplicitRel = fullMatch.startsWith('`./');
+    const isScript = /^scripts\/[a-zA-Z0-9_.-]+\.(?:sh|py|js|mjs|bash|ts)$/i.test(rel);
+    if (isExplicitRel || isScript) {
+      const target = resolve(dir, rel);
+      if (!existsSync(target) && !seen.has(rel)) {
+        seen.add(rel);
+        missing.push({ ref: rel, type: 'asset' });
+      }
+    }
+  }
+
+  return missing;
+}
+
 // The rules Command Code enforces before a skill is allowed to load.
 export function validate(name, dirName, description) {
   const problems = [];
@@ -153,6 +199,8 @@ function loadSkill(dir, file) {
   } catch {
     linked = false;
   }
+  const chars = name.trim().length + description.trim().length;
+  const payloadChars = text.length;
   return {
     name: name.trim() || dirName,
     declaredName: name.trim(),
@@ -160,7 +208,11 @@ function loadSkill(dir, file) {
     path: join(dir, file),
     description: description.trim(),
     hash: hash(text),
-    chars: name.trim().length + description.trim().length,
+    chars,
+    tokens: Math.ceil(chars / 4),
+    payloadChars,
+    payloadTokens: Math.ceil(payloadChars / 4),
+    missing: findMissingReferences(text, dir),
     linked,
     problems: validate(name.trim(), dirName, description.trim()),
   };
@@ -315,27 +367,35 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
     }
   }
   const entries = [...winners.values()];
-  const tokens = entries.reduce((sum, { skill }) => sum + Math.ceil(skill.chars / 4), 0);
-  const topSkills = [...entries]
-    .sort((a, b) => b.skill.chars - a.skill.chars)
-    .map(({ skill, root }) => ({
-      name: skill.name,
-      root,
-      chars: skill.chars,
-      tokens: Math.ceil(skill.chars / 4),
-    }));
+  const tokens = entries.reduce((sum, { skill }) => sum + skill.tokens, 0);
+  const payloadTokens = entries.reduce((sum, { skill }) => sum + skill.payloadTokens, 0);
+  const payloadChars = entries.reduce((sum, { skill }) => sum + skill.payloadChars, 0);
+  const topSkills = [...entries].map(({ skill, root }) => ({
+    name: skill.name,
+    root,
+    chars: skill.chars,
+    tokens: skill.tokens,
+    payloadChars: skill.payloadChars,
+    payloadTokens: skill.payloadTokens,
+  }));
 
   return {
     roots,
     count: entries.length,
     tokens,
+    payloadTokens,
+    payloadChars,
     shadowed,
     topSkills,
     skills: entries.map(({ skill, root }) => ({
       name: skill.name,
       root,
       chars: skill.chars,
+      tokens: skill.tokens,
+      payloadChars: skill.payloadChars,
+      payloadTokens: skill.payloadTokens,
       invalid: skill.problems,
+      missing: skill.missing,
     })),
   };
 }
@@ -388,6 +448,11 @@ export function audit(options = {}) {
     root.skills.filter((s) => s.problems.length).map((s) => ({ root: root.rel, dir: s.dir, name: s.name, problems: s.problems })),
   );
   const broken = present.flatMap((root) => root.broken);
+  const missing = present.flatMap((root) =>
+    root.skills.flatMap((s) =>
+      s.missing.map((m) => ({ root: root.rel, dir: s.dir, name: s.name, ref: m.ref, type: m.type })),
+    ),
+  );
 
   if (options.fix) {
     const fixes = applyFixes({ invalid, broken });
@@ -406,7 +471,7 @@ export function audit(options = {}) {
     };
   }
 
-  return { project, scanned, duplicates, cmd, invalid, broken, budget, fixes: [], options };
+  return { project, scanned, duplicates, cmd, invalid, broken, missing, budget, fixes: [], options };
 }
 
 // ------------------------------------------------------------------- report
@@ -447,7 +512,10 @@ function report(result) {
   for (const root of result.cmd.roots) {
     lines.push(`  ${root.exists ? `${root.skills.length} skills` : 'absent'}  ${root.rel}`);
   }
-  lines.push(`  loads ${result.cmd.count} skills, ~${result.cmd.tokens} tokens of metadata (${pct(result.cmd.tokens, 200000)} of a 200k window)`);
+  const avgPayload = result.cmd.count ? Math.round(result.cmd.payloadTokens / result.cmd.count) : 0;
+  lines.push(
+    `  loads ${result.cmd.count} skills: ~${result.cmd.tokens} tokens metadata (${pct(result.cmd.tokens, 200000)} of a 200k window) | ~${result.cmd.payloadTokens} tokens full payload (~${avgPayload} avg/skill)`,
+  );
   if (result.budget) {
     if (result.budget.exceeded) {
       lines.push(`  budget exceeded: ~${result.budget.tokens} tokens (limit: ${result.budget.limit})`);
@@ -462,13 +530,19 @@ function report(result) {
   }
 
   if (result.options?.top && result.cmd.topSkills?.length) {
-    const n = Math.min(result.options.top, result.cmd.topSkills.length);
+    const isPayload = result.options?.by === 'payload';
+    const sorted = [...result.cmd.topSkills].sort((a, b) =>
+      isPayload ? b.payloadTokens - a.payloadTokens : b.tokens - a.tokens,
+    );
+    const n = Math.min(result.options.top, sorted.length);
     lines.push('');
-    lines.push(`top ${n} skills by metadata token cost:`);
-    const namePad = Math.max(...result.cmd.topSkills.slice(0, n).map((s) => s.name.length), 10);
+    lines.push(`top ${n} skills by ${isPayload ? 'activation payload' : 'catalog metadata'} token cost:`);
+    const namePad = Math.max(...sorted.slice(0, n).map((s) => s.name.length), 10);
     for (let i = 0; i < n; i++) {
-      const s = result.cmd.topSkills[i];
-      lines.push(`  ${String(i + 1).padStart(2)}. ${s.name.padEnd(namePad)}  ~${String(s.tokens).padStart(4)} tokens (${s.chars} chars)`);
+      const s = sorted[i];
+      lines.push(
+        `  ${String(i + 1).padStart(2)}. ${s.name.padEnd(namePad)}  ~${String(s.tokens).padStart(4)} metadata  |  ~${String(s.payloadTokens).padStart(5)} payload tokens (${s.payloadChars} chars)`,
+      );
     }
   }
 
@@ -492,6 +566,14 @@ function report(result) {
     count += result.broken.length;
     issues.push(`broken: ${result.broken.length} dangling symlink(s)`);
     for (const b of result.broken) issues.push(`    ${b.path} -> ${b.target}`);
+  }
+  if (result.missing?.length) {
+    count += result.missing.length;
+    issues.push(`missing: ${result.missing.length} referenced companion asset(s) not found on disk`);
+    for (const m of result.missing) {
+      const desc = m.type === 'link' ? 'broken markdown link' : 'missing script or companion file';
+      issues.push(`    ${m.dir}: references "${m.ref}" (${desc})`);
+    }
   }
   if (drift.length) {
     count += drift.length;
@@ -534,7 +616,8 @@ function help() {
     'Options:',
     '  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)',
     '  --budget <n>   fail with exit code 1 if metadata exceeds token limit',
-    '  --top <n>      display top N skills by metadata token cost',
+    '  --top <n>      display top N skills by token cost',
+    '  --by <metric>  metric to sort top skills by: catalog (default) or payload',
     '  --json         machine-readable output',
     '  --project <dir> directory to resolve project roots against (default: cwd)',
     '  --no-global    skip user-level global roots',
@@ -557,6 +640,13 @@ function parseArgs(argv) {
     else if (arg === '--project') options.project = argv[++i];
     else if (arg === '--budget') options.budget = Number(argv[++i]);
     else if (arg === '--top') options.top = Number(argv[++i]);
+    else if (arg === '--by') {
+      const val = argv[++i];
+      if (val !== 'catalog' && val !== 'payload') {
+        return { error: `invalid --by value: ${val} (expected "catalog" or "payload")` };
+      }
+      options.by = val;
+    }
     else if (arg === '--root') options.extraRoots.push(argv[++i]);
     else if (arg === '--help' || arg === '-h') options.help = true;
     else return { error: `unknown argument: ${arg}` };
@@ -580,6 +670,7 @@ function main(argv) {
   let count =
     result.invalid.length +
     result.broken.length +
+    (result.missing?.length || 0) +
     result.duplicates.filter((d) => d.status === 'drift').length;
   if (result.budget?.exceeded) count++;
 

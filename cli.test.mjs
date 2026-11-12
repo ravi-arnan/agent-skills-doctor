@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { audit, parseFrontmatter, validate } from './cli.mjs';
+import { audit, findMissingReferences, parseFrontmatter, validate } from './cli.mjs';
 
 function skill(dir, name, description) {
   mkdirSync(dir, { recursive: true });
@@ -110,6 +110,95 @@ test('fix flag renames mismatched directory and cleans broken symlinks', () => {
     assert.equal(after.fixes.length, 2);
     assert.equal(after.invalid.length, 0);
     assert.equal(after.broken.length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('findMissingReferences flags missing links and scripts while ignoring codeblocks and external links', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-ref-'));
+  try {
+    const skillDir = join(root, 'my-skill');
+    mkdirSync(join(skillDir, 'scripts'), { recursive: true });
+    writeFileSync(join(skillDir, 'scripts/existing.sh'), '#!/bin/sh\n');
+
+    const markdown = [
+      '# My Skill',
+      '',
+      'See [docs](https://example.com) or [jump](#heading).',
+      'Valid link: [existing](scripts/existing.sh)',
+      'Missing link: [missing doc](./references/guide.md)',
+      'Valid script: `scripts/existing.sh`',
+      'Missing script: `scripts/missing.py`',
+      '',
+      '```markdown',
+      'Example inside fenced code block should be ignored:',
+      '[fake](references/ignored.md)',
+      '`scripts/fake.sh`',
+      '```',
+      '',
+      'Placeholder: `scripts/<id>.sh` or `path/to/script.py`',
+    ].join('\n');
+
+    const missing = findMissingReferences(markdown, skillDir);
+    assert.equal(missing.length, 2);
+    const refs = missing.map((m) => m.ref);
+    assert.ok(refs.includes('./references/guide.md'));
+    assert.ok(refs.includes('scripts/missing.py'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('audit detects missing companion assets and reports them', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-audit-missing-'));
+  try {
+    const dir = join(root, '.commandcode/skills/broken-ref');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'SKILL.md'),
+      '---\nname: broken-ref\ndescription: has broken ref\n---\n\nRun `scripts/missing.sh` to setup.',
+    );
+
+    const result = audit({ project: root, includeGlobal: false });
+    assert.equal(result.missing.length, 1);
+    assert.equal(result.missing[0].name, 'broken-ref');
+    assert.equal(result.missing[0].ref, 'scripts/missing.sh');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('payload tokens calculation and --by payload sorting work properly', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-payload-'));
+  try {
+    // Skill A: heavy metadata (300 chars), light payload (350 chars total)
+    const dirA = join(root, '.commandcode/skills/heavy-meta');
+    mkdirSync(dirA, { recursive: true });
+    writeFileSync(
+      join(dirA, 'SKILL.md'),
+      `---\nname: heavy-meta\ndescription: ${'m'.repeat(300)}\n---\n\nShort.`,
+    );
+
+    // Skill B: light metadata (20 chars), heavy payload (2000 chars total)
+    const dirB = join(root, '.commandcode/skills/heavy-payload');
+    mkdirSync(dirB, { recursive: true });
+    writeFileSync(
+      join(dirB, 'SKILL.md'),
+      `---\nname: heavy-payload\ndescription: short desc\n---\n\n${'p'.repeat(2000)}`,
+    );
+
+    const result = audit({ project: root, includeGlobal: false });
+    assert.ok(result.cmd.payloadTokens > result.cmd.tokens);
+
+    // By catalog (default): heavy-meta should be first
+    const catalogSorted = [...result.cmd.topSkills].sort((a, b) => b.tokens - a.tokens);
+    assert.equal(catalogSorted[0].name, 'heavy-meta');
+
+    // By payload: heavy-payload should be first
+    const payloadSorted = [...result.cmd.topSkills].sort((a, b) => b.payloadTokens - a.payloadTokens);
+    assert.equal(payloadSorted[0].name, 'heavy-payload');
+    assert.ok(payloadSorted[0].payloadTokens > 500);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

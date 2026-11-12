@@ -43,10 +43,11 @@ skills-doctor
 ## What it checks
 
 - **Invalid Skills**: Flags skills skipped by harnesses due to invalid frontmatter, mismatched directory names, missing descriptions, or invalid characters.
+- **Missing Assets & Scripts**: Detects referenced companion scripts (e.g. `scripts/run.sh`) or relative markdown links pointing to files missing on disk.
 - **Dangling Symlinks**: Finds symlinks pointing to non-existent targets.
 - **Skill Drift**: Detects skills with identical names but different content (SHA-256 hash comparison across agent directories).
 - **Shadowed Skills**: Identifies duplicate skills across project and global roots where higher-precedence roots override lower-precedence ones.
-- **Token Budget**: Measures the exact metadata token consumption loaded into your agent's context window.
+- **Token Footprint & Payload**: Measures both the catalog metadata token cost (injected every turn) and the full activation payload cost when skills are invoked.
 
 ---
 
@@ -85,7 +86,8 @@ Health check, linter, and token auditor for agent skills across every harness ro
 Options:
   --fix          automatically repair safe issues (rename mismatched folders, remove broken links)
   --budget <n>   fail with exit code 1 if metadata exceeds token limit
-  --top <n>      display top N skills by metadata token cost
+  --top <n>      display top N skills by token cost
+  --by <metric>  metric to sort top skills by: catalog (default) or payload
   --json         machine-readable output
   --project <dir> directory to resolve project roots against (default: cwd)
   --no-global    skip user-level global roots
