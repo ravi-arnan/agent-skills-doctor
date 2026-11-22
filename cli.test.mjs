@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { audit, diffSkill, findMissingReferences, parseFrontmatter, validate } from './cli.mjs';
+import { audit, diffSkill, findMissingReferences, loadConfig, parseFrontmatter, validate } from './cli.mjs';
+
+const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), 'cli.mjs');
 
 function skill(dir, name, description) {
   mkdirSync(dir, { recursive: true });
@@ -358,6 +362,123 @@ test('fix respects --ignore for invalid skills', () => {
     const result = audit({ project: root, includeGlobal: false, fix: true, ignore: ['ignored-skill'] });
     assert.equal(result.fixes.length, 0);
     assert.equal(lstatSync(wrongDir).isDirectory(), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('parseFrontmatter supports multi-line block scalars and folded continuations', () => {
+  const literal = parseFrontmatter('---\nname: my-skill\ndescription: |\n  line one\n  line two\nmetadata:\n  x: 1\n---\n');
+  assert.equal(literal.name, 'my-skill');
+  assert.equal(literal.description, 'line one\nline two');
+
+  const folded = parseFrontmatter('---\nname: folded\ndescription: >-\n  first part\n  second part\n\n  new paragraph\n---\n');
+  assert.equal(folded.description, 'first part second part\nnew paragraph');
+
+  const indented = parseFrontmatter('---\nname: plain\ndescription:\n  wrapped line\n  continues here\n---\n');
+  assert.equal(indented.description, 'wrapped line continues here');
+
+  const emptyField = parseFrontmatter('---\nname: empty-desc\ndescription:\nmetadata:\n  foo: bar\n---\n');
+  assert.equal(emptyField.description, '');
+});
+
+test('findMissingReferences skips Example lines, tilde fences, comments, and data/tel URIs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-ref-extra-'));
+  try {
+    const skillDir = join(root, 'doc-skill');
+    mkdirSync(skillDir, { recursive: true });
+    const markdown = [
+      '<!-- [commented](references/hidden.md) -->',
+      '- **Example**: `scripts/rotate_pdf.py` for PDF rotation',
+      'Contact [phone](tel:+123456) or [inline](data:text/plain;base64,QQ==)',
+      '~~~bash',
+      '`scripts/fenced.sh`',
+      '~~~',
+      'Actually needed: `scripts/real-missing.sh`',
+    ].join('\n');
+    const missing = findMissingReferences(markdown, skillDir);
+    assert.deepEqual(missing, [{ ref: 'scripts/real-missing.sh', type: 'asset' }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('findDuplicates detects duplicate skill names nested within the same root', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-intraroot-'));
+  try {
+    skill(join(root, '.claude/skills/team-a/dup'), 'dup', 'variant a');
+    skill(join(root, '.claude/skills/team-b/dup'), 'dup', 'variant b');
+    const result = audit({ project: root, includeGlobal: false });
+    assert.equal(result.duplicates.length, 1);
+    assert.equal(result.duplicates[0].name, 'dup');
+    assert.equal(result.duplicates[0].status, 'drift');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('harness option and auto-detection audit non-CommandCode harnesses accurately', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-harness-'));
+  try {
+    skill(join(root, '.claude/skills/claude-only'), 'claude-only', 'a'.repeat(120));
+    skill(join(root, '.cursor/skills/cursor-only'), 'cursor-only', 'b'.repeat(80));
+
+    // Auto-detects across active harnesses when Command Code roots are absent
+    const autoResult = audit({ project: root, includeGlobal: false, budget: 10 });
+    assert.equal(autoResult.catalog.harness, 'all');
+    assert.equal(autoResult.catalog.count, 2);
+    assert.equal(autoResult.budget.exceeded, true);
+
+    // Explicit --harness filters catalog and budget to that harness
+    const claudeOnly = audit({ project: root, includeGlobal: false, harness: 'claude-code' });
+    assert.equal(claudeOnly.catalog.harness, 'claude-code');
+    assert.equal(claudeOnly.catalog.count, 1);
+    assert.equal(claudeOnly.catalog.skills[0].name, 'claude-only');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CLI subprocess handles exit codes, --json, diff, config file, and validation errors', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-cli-'));
+  try {
+    skill(join(root, '.claude/skills/alpha'), 'alpha', 'alpha skill');
+    writeFileSync(
+      join(root, '.skills-doctor.json'),
+      JSON.stringify({ harness: 'claude-code', budget: 5000, noGlobal: true }),
+    );
+
+    // Exit 0 + JSON output using config file
+    const ok = spawnSync(process.execPath, [CLI_PATH, '--project', root, '--json'], { encoding: 'utf8' });
+    assert.equal(ok.status, 0);
+    const parsed = JSON.parse(ok.stdout);
+    assert.equal(parsed.problemCount, 0);
+    assert.equal(parsed.catalog.harness, 'claude-code');
+    assert.equal(parsed.budget.limit, 5000);
+
+    // CLI flag overrides config budget -> exit 1
+    const overBudget = spawnSync(process.execPath, [CLI_PATH, '--project', root, '--budget', '1'], { encoding: 'utf8' });
+    assert.equal(overBudget.status, 1);
+    assert.match(overBudget.stdout, /Skills catalog \(claude-code\)/);
+    assert.match(overBudget.stdout, /budget exceeded/);
+
+    // Invalid CLI args -> exit 2
+    const badBudget = spawnSync(process.execPath, [CLI_PATH, '--budget', 'not-a-number'], { encoding: 'utf8' });
+    assert.equal(badBudget.status, 2);
+    const badHarness = spawnSync(process.execPath, [CLI_PATH, '--harness', 'nonexistent'], { encoding: 'utf8' });
+    assert.equal(badHarness.status, 2);
+
+    // diff subcommand -> exit 0 when found, exit 1 when missing
+    const diffOk = execFileSync(process.execPath, [CLI_PATH, 'diff', 'alpha', '--project', root, '--no-global'], { encoding: 'utf8' });
+    assert.match(diffOk, /alpha: 1 copy/);
+    const diffMiss = spawnSync(process.execPath, [CLI_PATH, 'diff', 'missing-skill', '--project', root, '--no-global'], { encoding: 'utf8' });
+    assert.equal(diffMiss.status, 1);
+
+    // Invalid .skills-doctor.json -> exit 2
+    writeFileSync(join(root, '.skills-doctor.json'), '{ bad json');
+    assert.ok(loadConfig(root).error);
+    const badCfg = spawnSync(process.execPath, [CLI_PATH, '--project', root], { encoding: 'utf8' });
+    assert.equal(badCfg.status, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

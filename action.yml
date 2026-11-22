@@ -10,8 +10,20 @@ inputs:
     description: 'Directory to resolve project roots against (default: current directory)'
     required: false
     default: '.'
+  harness:
+    description: 'Audit catalog/budget for a specific harness (e.g. claude-code, cursor, all)'
+    required: false
   budget:
     description: 'Maximum token limit for metadata catalog. Fails with exit code 1 if exceeded'
+    required: false
+  top:
+    description: 'Display top N skills by token cost'
+    required: false
+  by:
+    description: 'Metric to sort top skills by: catalog or payload'
+    required: false
+  ignore:
+    description: 'Comma- or newline-separated skill names to ignore'
     required: false
   no-global:
     description: 'Skip scanning user-level global roots (ideal for CI repos)'
@@ -28,14 +40,30 @@ runs:
     - name: Run agent-skills-doctor
       shell: bash
       run: |
-        CMD="node ${{ github.action_path }}/cli.mjs --project ${{ inputs.project }}"
+        ARGS=(--project "${{ inputs.project }}")
         if [ "${{ inputs.no-global }}" = "true" ]; then
-          CMD="$CMD --no-global"
+          ARGS+=(--no-global)
+        fi
+        if [ -n "${{ inputs.harness }}" ]; then
+          ARGS+=(--harness "${{ inputs.harness }}")
         fi
         if [ -n "${{ inputs.budget }}" ]; then
-          CMD="$CMD --budget ${{ inputs.budget }}"
+          ARGS+=(--budget "${{ inputs.budget }}")
+        fi
+        if [ -n "${{ inputs.top }}" ]; then
+          ARGS+=(--top "${{ inputs.top }}")
+        fi
+        if [ -n "${{ inputs.by }}" ]; then
+          ARGS+=(--by "${{ inputs.by }}")
+        fi
+        if [ -n "${{ inputs.ignore }}" ]; then
+          while IFS= read -r item; do
+            item="${item#"${item%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            [ -n "$item" ] && ARGS+=(--ignore "$item")
+          done < <(printf '%s\n' "${{ inputs.ignore }}" | tr ',' '\n')
         fi
         if [ "${{ inputs.fix }}" = "true" ]; then
-          CMD="$CMD --fix"
+          ARGS+=(--fix)
         fi
-        $CMD
+        node "${{ github.action_path }}/cli.mjs" "${ARGS[@]}"

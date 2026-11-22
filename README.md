@@ -85,20 +85,35 @@ usage: skills-doctor [options]
 Health check, linter, and token auditor for agent skills across every harness root.
 
 Options:
-  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)
-  --sync         replace duplicate/stale skill copies with symlinks to the newest or --prefer root
-  --prefer <root> preferred source root for --sync (e.g. ~/.agents/skills or agents)
-  --dry-run      preview --sync changes without modifying files
-  --budget <n>   fail with exit code 1 if metadata exceeds token limit
-  --top <n>      display top N skills by token cost
-  --by <metric>  metric to sort top skills by: catalog (default) or payload
-  --json         machine-readable output
-  --project <dir> directory to resolve project roots against (default: cwd)
-  --no-global    skip user-level global roots
-  --no-project   skip project-level roots
-  --root <dir>   extra root to scan (repeatable)
-  --ignore <name> ignore drift/missing/invalid issues for a skill (repeatable)
-  -h, --help     show this help text
+  --fix             automatically repair safe issues (rename mismatched folders, remove broken links)
+  --sync            replace duplicate/stale skill copies with symlinks to the newest or --prefer root
+  --prefer <root>   preferred source root for --sync (e.g. ~/.agents/skills or agents)
+  --dry-run         preview --sync changes without modifying files
+  --harness <name>  audit catalog/budget for a specific harness (e.g. claude-code, cursor, all)
+  --budget <n>      fail with exit code 1 if metadata exceeds token limit
+  --top <n>         display top N skills by token cost
+  --by <metric>     metric to sort top skills by: catalog (default) or payload
+  --json            machine-readable output
+  --project <dir>   directory to resolve project roots against (default: cwd)
+  --no-global       skip user-level global roots
+  --no-project      skip project-level roots
+  --root <dir>      extra root to scan (repeatable)
+  --ignore <name>   ignore drift/missing/invalid issues for a skill (repeatable)
+  -h, --help        show this help text
+```
+
+### Configuration File (`.skills-doctor.json`)
+
+You can persist project defaults in a `.skills-doctor.json` file at the project root (CLI flags always take precedence):
+
+```json
+{
+  "harness": "claude-code",
+  "budget": 4000,
+  "noGlobal": true,
+  "ignore": ["intentional-override"],
+  "roots": ["custom/skills"]
+}
 ```
 
 ### Exit Codes

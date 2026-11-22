@@ -85,6 +85,12 @@ const CMD_ROOTS = [
   ['agents-user', '~/.agents/skills'],
 ];
 
+const VALID_HARNESSES = new Set([
+  'all',
+  ...GLOBAL_ROOTS.map(([label]) => label),
+  ...PROJECT_ROOTS.map(([label]) => label),
+]);
+
 // ------------------------------------------------------------------ helpers
 
 function expand(path, project) {
@@ -148,26 +154,84 @@ function hashSkillDir(rootDir) {
 }
 
 // Only `name` and `description` are read; a full YAML parser is not worth it
-// here. Values are unquoted so `name: "foo"` and `name: foo` behave the same.
+// here. Supports single-line quoted/unquoted values as well as multi-line
+// block scalars (`|`, `>`, `|-`, `>-`) and indented continuations.
 export function parseFrontmatter(text) {
-  const block = /^---\n([\s\S]*?)\n---/.exec(text.replace(/\r\n/g, '\n'));
+  const normalized = text.replace(/\r\n/g, '\n');
+  const block = /^---\s*\n([\s\S]*?)(?:\n)?---(?:\s*$|\s*\n)/.exec(normalized);
   if (!block) return {};
-  const field = (key) => {
-    const m = new RegExp(`^${key}:\\s*(.+?)\\s*$`, 'm').exec(block[1]);
-    return m ? m[1].replace(/^["']|["']$/g, '') : '';
-  };
-  return { name: field('name'), description: field('description') };
+  const lines = block[1].split('\n');
+  const fields = {};
+
+  for (let i = 0; i < lines.length; i++) {
+    const keyMatch = /^([a-zA-Z0-9_-]+):\s*(.*)$/.exec(lines[i]);
+    if (!keyMatch) continue;
+    const [, key, rawVal] = keyMatch;
+    if (key !== 'name' && key !== 'description') continue;
+
+    const val = rawVal.trim();
+    const blockMatch = /^([|>])([+-])?\d*$/.exec(val);
+    if (blockMatch || val === '') {
+      const style = blockMatch ? blockMatch[1] : 'plain';
+      const chomp = blockMatch ? blockMatch[2] || '' : '';
+      const collected = [];
+      let baseIndent = null;
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (next.trim() === '') {
+          collected.push('');
+          i++;
+          continue;
+        }
+        const indentMatch = /^([ \t]+)(.*)$/.exec(next);
+        if (!indentMatch) break;
+        const indentLen = indentMatch[1].length;
+        if (baseIndent === null) baseIndent = indentLen;
+        collected.push(next.slice(Math.min(baseIndent, indentLen)));
+        i++;
+      }
+      while (collected.length && collected[collected.length - 1] === '') {
+        if (chomp === '+') break;
+        collected.pop();
+      }
+      if (style === '|') {
+        fields[key] = collected.join('\n');
+      } else {
+        const paragraphs = [];
+        let current = [];
+        for (const line of collected) {
+          if (line === '') {
+            if (current.length) {
+              paragraphs.push(current.join(' '));
+              current = [];
+            }
+          } else {
+            current.push(line.trim());
+          }
+        }
+        if (current.length) paragraphs.push(current.join(' '));
+        fields[key] = paragraphs.join('\n');
+      }
+    } else {
+      fields[key] = val.replace(/^["']|["']$/g, '');
+    }
+  }
+
+  return { name: fields.name || '', description: fields.description || '' };
 }
 
 // Scans SKILL.md body for relative links or companion script paths that do not exist on disk.
 export function findMissingReferences(text, dir) {
-  const clean = text.replace(/```[\s\S]*?```/g, '');
+  const clean = text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/~~~[\s\S]*?~~~/g, '')
+    .replace(/<!--[\s\S]*?-->/g, '');
   const missing = [];
   const seen = new Set();
   const isPlaceholder = (p) => /<.*?>|\[.*?\]|\.\.\/|\*|\?|path\/to|example\//i.test(p);
 
   // 1. Markdown links & image embeds: [text](path) or ![alt](path)
-  const linkRegex = /(?:\[[^\]]*\]|!\[[^\]]*\])\((?!https?:\/\/|mailto:|#|file:)([^)#\s]+)(?:#[^)]*)?\)/g;
+  const linkRegex = /(?:\[[^\]]*\]|!\[[^\]]*\])\((?!https?:\/\/|mailto:|tel:|data:|#|file:)([^)#\s]+)(?:#[^)]*)?\)/g;
   let m;
   while ((m = linkRegex.exec(clean)) !== null) {
     const rel = m[1].trim().replace(/^["']|["']$/g, '');
@@ -188,6 +252,11 @@ export function findMissingReferences(text, dir) {
   // 2. Scripts and explicit relative companion paths in backticks: `scripts/run.sh` or `./scripts/run.py`
   const codeRegex = /`(?:\.\/)?((?:scripts|references|reference|templates|resources|assets)\/[a-zA-Z0-9_.-]+)(?:\s+[^`]*)?`/g;
   while ((m = codeRegex.exec(clean)) !== null) {
+    const lineStart = clean.lastIndexOf('\n', m.index) + 1;
+    const lineEnd = clean.indexOf('\n', m.index);
+    const lineText = clean.slice(lineStart, lineEnd === -1 ? clean.length : lineEnd);
+    if (/^\s*(?:[-*]\s*)?(?:\*\*)?examples?(?:\*\*)?\s*:/i.test(lineText)) continue;
+
     const fullMatch = m[0];
     const rel = m[1].trim().replace(/[.,;:]+$/, '');
     if (!rel || isPlaceholder(rel)) continue;
@@ -344,9 +413,10 @@ function scanRoot({ label, rel, scope }, project) {
   };
 }
 
-// Same skill name in more than one root. `linked` means every copy resolves to
-// one directory (a symlink fan-out, not real duplication); `identical` means
-// separate copies with the same bytes; `drift` means they have diverged.
+// Same skill name in more than one directory (across roots or nested within the
+// same root). `linked` means every copy resolves to one directory (a symlink
+// fan-out, not real duplication); `identical` means separate copies with the
+// same bytes; `drift` means they have diverged.
 export function findDuplicates(roots) {
   const byName = new Map();
   for (const root of roots) {
@@ -367,7 +437,7 @@ export function findDuplicates(roots) {
   }
   const out = [];
   for (const [name, copies] of byName) {
-    if (new Set(copies.map((c) => c.root)).size < 2) continue;
+    if (new Set(copies.map((c) => c.dir)).size < 2) continue;
     const oneDir = new Set(copies.map((c) => c.real)).size === 1;
     const oneHash = new Set(copies.map((c) => c.hash)).size === 1;
     out.push({
@@ -403,15 +473,7 @@ function uniqueRoots(roots, project) {
   return out;
 }
 
-// The catalog Command Code loads, deduped by precedence: project before user,
-// and `.commandcode/` before `.agents/` at the same level. `includeUser` is off
-// in tests so they never read the real home directory.
-export function cmdCatalog(project, { includeUser = true } = {}) {
-  const table = includeUser ? CMD_ROOTS : CMD_ROOTS.filter(([, rel]) => !rel.startsWith('~'));
-  const roots = uniqueRoots(
-    table.map(([label, rel]) => ({ label, rel, scope: 'cmd' })),
-    project,
-  ).map((root) => scanRoot(root, project));
+function buildCatalog(roots, harness = 'command-code') {
   const winners = new Map();
   const shadowed = [];
   for (const root of roots) {
@@ -441,6 +503,7 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
   }));
 
   return {
+    harness,
     roots,
     count: entries.length,
     tokens,
@@ -461,11 +524,56 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
   };
 }
 
+// The catalog Command Code loads, deduped by precedence: project before user,
+// and `.commandcode/` before `.agents/` at the same level. `includeUser` is off
+// in tests so they never read the real home directory.
+export function cmdCatalog(project, { includeUser = true, includeProject = true } = {}) {
+  const table = CMD_ROOTS.filter(
+    ([, rel]) => (includeUser || !rel.startsWith('~')) && (includeProject || rel.startsWith('~')),
+  );
+  const roots = uniqueRoots(
+    table.map(([label, rel]) => ({ label, rel, scope: 'cmd' })),
+    project,
+  ).map((root) => scanRoot(root, project));
+  return buildCatalog(roots, 'command-code');
+}
+
+function selectCatalog(harness, scanned, cmd) {
+  const projectFirst = [...scanned].sort((a, b) => {
+    const rank = (s) => (s === 'project' ? 0 : s === 'custom' ? 1 : 2);
+    return rank(a.scope) - rank(b.scope);
+  });
+
+  if (harness === 'command-code') return cmd;
+  if (harness === 'all') return buildCatalog(projectFirst, 'all');
+  if (harness) {
+    return buildCatalog(
+      projectFirst.filter((r) => r.label === harness),
+      harness,
+    );
+  }
+
+  // Default: Command Code when present; otherwise auto-detect active harness(es)
+  // so --budget and --top work out of the box for Claude Code, Cursor, etc.
+  if (cmd.count > 0) return cmd;
+  const activeLabels = [...new Set(projectFirst.filter((r) => r.skills.length > 0).map((r) => r.label))];
+  if (activeLabels.length === 1) {
+    const label = activeLabels[0];
+    return buildCatalog(
+      projectFirst.filter((r) => r.label === label),
+      label,
+    );
+  }
+  if (activeLabels.length > 1) return buildCatalog(projectFirst, 'all');
+  return cmd;
+}
+
 export function applyFixes({ invalid = [], broken = [] } = {}) {
   const fixes = [];
   // 1. Rename mismatched skill directories if safe and target doesn't exist
   for (const s of invalid) {
     if (!s.name || s.problems.length > 1) continue;
+    if (s.name.includes('/') || s.name.includes('\\') || s.name.includes('..')) continue;
     const isMismatch = s.problems[0]?.includes('does not match directory');
     if (!isMismatch) continue;
     const parent = dirname(s.dir);
@@ -507,7 +615,11 @@ export function audit(options = {}) {
   const duplicates = findDuplicates(present).map((d) =>
     ignored.has(d.name) ? { ...d, ignored: true } : d,
   );
-  const cmd = cmdCatalog(project, { includeUser: options.includeGlobal !== false });
+  const cmd = cmdCatalog(project, {
+    includeUser: options.includeGlobal !== false,
+    includeProject: options.includeProject !== false,
+  });
+  const catalog = selectCatalog(options.harness, scanned, cmd);
   const invalid = present.flatMap((root) =>
     root.skills
       .filter((s) => s.problems.length)
@@ -549,12 +661,12 @@ export function audit(options = {}) {
   if (typeof options.budget === 'number' && !isNaN(options.budget)) {
     budget = {
       limit: options.budget,
-      tokens: cmd.tokens,
-      exceeded: cmd.tokens > options.budget,
+      tokens: catalog.tokens,
+      exceeded: catalog.tokens > options.budget,
     };
   }
 
-  return { project, scanned, duplicates, cmd, invalid, broken, missing, budget, fixes, syncs, options };
+  return { project, scanned, duplicates, cmd, catalog, invalid, broken, missing, budget, fixes, syncs, options };
 }
 
 export function applySync(duplicates, { prefer, dryRun = false, project = process.cwd() } = {}) {
@@ -592,6 +704,10 @@ export function applySync(duplicates, { prefer, dryRun = false, project = proces
         continue;
       }
       try {
+        if (!existsSync(source.real)) {
+          syncs.push({ action: 'error', name: dup.name, from: copy.dir, to: source.real, error: 'source directory no longer exists' });
+          continue;
+        }
         rmSync(copy.dir, { recursive: true, force: true });
         symlinkSync(source.real, copy.dir, 'dir');
         syncs.push({ action: 'linked', name: dup.name, from: copy.dir, to: source.real });
@@ -724,14 +840,24 @@ function report(result) {
     lines.push(`  ${root.rel.padEnd(widest)}  ${String(root.skills.length).padStart(3)} skills  (${detail})`);
   }
 
+  const catalog = result.catalog || result.cmd;
+  const catalogTitle =
+    catalog.harness === 'command-code' || !catalog.harness
+      ? 'Command Code catalog'
+      : catalog.harness === 'all'
+        ? 'Skills catalog (all harnesses)'
+        : `Skills catalog (${catalog.harness})`;
+  const visibleRoots =
+    catalog.harness === 'all' ? catalog.roots.filter((r) => r.exists) : catalog.roots;
+
   lines.push('');
-  lines.push('Command Code catalog');
-  for (const root of result.cmd.roots) {
+  lines.push(catalogTitle);
+  for (const root of visibleRoots) {
     lines.push(`  ${root.exists ? `${root.skills.length} skills` : 'absent'}  ${root.rel}`);
   }
-  const avgPayload = result.cmd.count ? Math.round(result.cmd.payloadTokens / result.cmd.count) : 0;
+  const avgPayload = catalog.count ? Math.round(catalog.payloadTokens / catalog.count) : 0;
   lines.push(
-    `  loads ${result.cmd.count} skills: ~${result.cmd.tokens} tokens metadata (${pct(result.cmd.tokens, 200000)} of a 200k window) | ~${result.cmd.payloadTokens} tokens full payload (~${avgPayload} avg/skill)`,
+    `  loads ${catalog.count} skills: ~${catalog.tokens} tokens metadata (${pct(catalog.tokens, 200000)} of a 200k window) | ~${catalog.payloadTokens} tokens full payload (~${avgPayload} avg/skill)`,
   );
   if (result.budget) {
     if (result.budget.exceeded) {
@@ -741,14 +867,14 @@ function report(result) {
     }
   }
 
-  if (result.cmd.shadowed.length) {
-    lines.push(`  shadowed: ${result.cmd.shadowed.length}`);
-    for (const s of result.cmd.shadowed) lines.push(`    ${s.name}: keeps ${s.kept}, drops ${s.dropped}`);
+  if (catalog.shadowed.length) {
+    lines.push(`  shadowed: ${catalog.shadowed.length}`);
+    for (const s of catalog.shadowed) lines.push(`    ${s.name}: keeps ${s.kept}, drops ${s.dropped}`);
   }
 
-  if (result.options?.top && result.cmd.topSkills?.length) {
+  if (result.options?.top && catalog.topSkills?.length) {
     const isPayload = result.options?.by === 'payload';
-    const sorted = [...result.cmd.topSkills].sort((a, b) =>
+    const sorted = [...catalog.topSkills].sort((a, b) =>
       isPayload ? b.payloadTokens - a.payloadTokens : b.tokens - a.tokens,
     );
     const n = Math.min(result.options.top, sorted.length);
@@ -853,27 +979,112 @@ function help() {
     'Health check, linter, and token auditor for agent skills across every harness root.',
     '',
     'Options:',
-    '  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)',
-    '  --sync         replace duplicate/stale skill copies with symlinks to the newest or --prefer root',
-    '  --prefer <root> preferred source root for --sync (e.g. ~/.agents/skills or agents)',
-    '  --dry-run      preview --sync changes without modifying files',
-    '  --budget <n>   fail with exit code 1 if metadata exceeds token limit',
-    '  --top <n>      display top N skills by token cost',
-    '  --by <metric>  metric to sort top skills by: catalog (default) or payload',
-    '  --json         machine-readable output',
-    '  --project <dir> directory to resolve project roots against (default: cwd)',
-    '  --no-global    skip user-level global roots',
-    '  --no-project   skip project-level roots',
-    '  --root <dir>   extra root to scan (repeatable)',
-    '  --ignore <name> ignore drift/missing/invalid issues for a skill (repeatable)',
-    '  -h, --help     show this help text',
+    '  --fix             automatically repair safe issues (rename mismatched folders, remove broken links)',
+    '  --sync            replace duplicate/stale skill copies with symlinks to the newest or --prefer root',
+    '  --prefer <root>   preferred source root for --sync (e.g. ~/.agents/skills or agents)',
+    '  --dry-run         preview --sync changes without modifying files',
+    '  --harness <name>  audit catalog/budget for a specific harness (e.g. claude-code, cursor, all)',
+    '  --budget <n>      fail with exit code 1 if metadata exceeds token limit',
+    '  --top <n>         display top N skills by token cost',
+    '  --by <metric>     metric to sort top skills by: catalog (default) or payload',
+    '  --json            machine-readable output',
+    '  --project <dir>   directory to resolve project roots against (default: cwd)',
+    '  --no-global       skip user-level global roots',
+    '  --no-project      skip project-level roots',
+    '  --root <dir>      extra root to scan (repeatable)',
+    '  --ignore <name>   ignore drift/missing/invalid issues for a skill (repeatable)',
+    '  -h, --help        show this help text',
+    '',
+    'Config:',
+    '  Reads optional .skills-doctor.json from the project directory (CLI flags override).',
     '',
     'exit: 0 clean, 1 problems found, 2 usage error',
   ].join('\n');
 }
 
+export function loadConfig(project) {
+  const cfgPath = join(project, '.skills-doctor.json');
+  if (!existsSync(cfgPath)) return {};
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  } catch (err) {
+    return { error: `invalid .skills-doctor.json: ${err.message}` };
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { error: 'invalid .skills-doctor.json: expected a JSON object' };
+  }
+  const cfg = {};
+  if (raw.ignore !== undefined) {
+    if (!Array.isArray(raw.ignore) || raw.ignore.some((v) => typeof v !== 'string')) {
+      return { error: 'invalid .skills-doctor.json: "ignore" must be an array of strings' };
+    }
+    cfg.ignore = raw.ignore;
+  }
+  if (raw.roots !== undefined) {
+    if (!Array.isArray(raw.roots) || raw.roots.some((v) => typeof v !== 'string')) {
+      return { error: 'invalid .skills-doctor.json: "roots" must be an array of strings' };
+    }
+    cfg.roots = raw.roots;
+  }
+  if (raw.budget !== undefined) {
+    if (!Number.isInteger(raw.budget) || raw.budget < 0) {
+      return { error: 'invalid .skills-doctor.json: "budget" must be a non-negative integer' };
+    }
+    cfg.budget = raw.budget;
+  }
+  if (raw.top !== undefined) {
+    if (!Number.isInteger(raw.top) || raw.top < 1) {
+      return { error: 'invalid .skills-doctor.json: "top" must be a positive integer' };
+    }
+    cfg.top = raw.top;
+  }
+  if (raw.by !== undefined) {
+    if (raw.by !== 'catalog' && raw.by !== 'payload') {
+      return { error: 'invalid .skills-doctor.json: "by" must be "catalog" or "payload"' };
+    }
+    cfg.by = raw.by;
+  }
+  if (raw.harness !== undefined) {
+    if (typeof raw.harness !== 'string' || !VALID_HARNESSES.has(raw.harness)) {
+      return { error: `invalid .skills-doctor.json: unknown harness "${raw.harness}"` };
+    }
+    cfg.harness = raw.harness;
+  }
+  if (raw.noGlobal !== undefined) {
+    if (typeof raw.noGlobal !== 'boolean') {
+      return { error: 'invalid .skills-doctor.json: "noGlobal" must be a boolean' };
+    }
+    cfg.noGlobal = raw.noGlobal;
+  }
+  if (raw.noProject !== undefined) {
+    if (typeof raw.noProject !== 'boolean') {
+      return { error: 'invalid .skills-doctor.json: "noProject" must be a boolean' };
+    }
+    cfg.noProject = raw.noProject;
+  }
+  return cfg;
+}
+
 function parseArgs(argv) {
   const options = { extraRoots: [], ignore: [] };
+  const nextVal = (i, flag) => {
+    const val = argv[i + 1];
+    if (val === undefined || val === '' || val.startsWith('-')) {
+      return { error: `missing value for ${flag}` };
+    }
+    return { val };
+  };
+  const nextInt = (i, flag, min) => {
+    const raw = argv[i + 1];
+    if (raw === undefined || raw === '') return { error: `missing value for ${flag}` };
+    const num = Number(raw);
+    if (!Number.isInteger(num) || num < min) {
+      return { error: `invalid ${flag} value: ${raw} (expected integer >= ${min})` };
+    }
+    return { val: num };
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === 'diff' && !options.command) {
@@ -887,27 +1098,60 @@ function parseArgs(argv) {
     else if (arg === '--sync') options.sync = true;
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--prefer') {
-      const val = argv[++i];
-      if (!val || val.startsWith('-')) return { error: 'missing value for --prefer' };
-      options.prefer = val;
+      const res = nextVal(i, '--prefer');
+      if (res.error) return res;
+      options.prefer = res.val;
+      i++;
+    }
+    else if (arg === '--harness') {
+      const res = nextVal(i, '--harness');
+      if (res.error) return res;
+      if (!VALID_HARNESSES.has(res.val)) {
+        return { error: `unknown --harness value: ${res.val} (valid: ${[...VALID_HARNESSES].join(', ')})` };
+      }
+      options.harness = res.val;
+      i++;
     }
     else if (arg === '--no-global') options.includeGlobal = false;
     else if (arg === '--no-project') options.includeProject = false;
-    else if (arg === '--project') options.project = argv[++i];
-    else if (arg === '--budget') options.budget = Number(argv[++i]);
-    else if (arg === '--top') options.top = Number(argv[++i]);
-    else if (arg === '--by') {
-      const val = argv[++i];
-      if (val !== 'catalog' && val !== 'payload') {
-        return { error: `invalid --by value: ${val} (expected "catalog" or "payload")` };
-      }
-      options.by = val;
+    else if (arg === '--project') {
+      const res = nextVal(i, '--project');
+      if (res.error) return res;
+      options.project = res.val;
+      i++;
     }
-    else if (arg === '--root') options.extraRoots.push(argv[++i]);
+    else if (arg === '--budget') {
+      const res = nextInt(i, '--budget', 0);
+      if (res.error) return res;
+      options.budget = res.val;
+      i++;
+    }
+    else if (arg === '--top') {
+      const res = nextInt(i, '--top', 1);
+      if (res.error) return res;
+      options.top = res.val;
+      i++;
+    }
+    else if (arg === '--by') {
+      const res = nextVal(i, '--by');
+      if (res.error) return res;
+      if (res.val !== 'catalog' && res.val !== 'payload') {
+        return { error: `invalid --by value: ${res.val} (expected "catalog" or "payload")` };
+      }
+      options.by = res.val;
+      i++;
+    }
+    else if (arg === '--root') {
+      const res = nextVal(i, '--root');
+      if (res.error) return res;
+      options.extraRoots.push(res.val);
+      i++;
+    }
     else if (arg === '--ignore') {
-      const val = argv[++i];
-      if (!val || val.startsWith('-')) return { error: 'missing value for --ignore' };
-      options.ignore.push(val);
+      const res = nextVal(i, '--ignore');
+      if (res.error) return res;
+      options.ignore.push(res.val);
+      i++;
     }
     else if (arg === '--help' || arg === '-h') options.help = true;
     else return { error: `unknown argument: ${arg}` };
@@ -915,17 +1159,38 @@ function parseArgs(argv) {
   return options;
 }
 
+function mergeOptions(config, cli) {
+  return {
+    ...cli,
+    ignore: [...new Set([...(config.ignore || []), ...cli.ignore])],
+    extraRoots: [...new Set([...(config.roots || []), ...cli.extraRoots])],
+    budget: cli.budget ?? config.budget,
+    top: cli.top ?? config.top,
+    by: cli.by ?? config.by,
+    harness: cli.harness ?? config.harness,
+    includeGlobal: cli.includeGlobal !== undefined ? cli.includeGlobal : config.noGlobal ? false : undefined,
+    includeProject: cli.includeProject !== undefined ? cli.includeProject : config.noProject ? false : undefined,
+  };
+}
+
 function main(argv) {
-  const options = parseArgs(argv);
-  if (options.error) {
-    console.error(options.error);
+  const cliOptions = parseArgs(argv);
+  if (cliOptions.error) {
+    console.error(cliOptions.error);
     console.error(help());
     return 2;
   }
-  if (options.help) {
+  if (cliOptions.help) {
     console.log(help());
     return 0;
   }
+
+  const config = loadConfig(cliOptions.project || process.cwd());
+  if (config.error) {
+    console.error(config.error);
+    return 2;
+  }
+  const options = mergeOptions(config, cliOptions);
 
   const result = audit(options);
   if (options.command === 'diff') {
